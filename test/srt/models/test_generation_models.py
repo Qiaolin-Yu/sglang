@@ -106,6 +106,7 @@ class TestGenerationModels(CustomTestCase):
             tp_size=model_case.tp_size,
             torch_dtype=torch_dtype,
             model_type="generation",
+            attention_backend="flashinfer",
             trust_remote_code=model_case.trust_remote_code,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
