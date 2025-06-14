@@ -1014,6 +1014,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
     ):
         if self.attention_backend == "fa3" or self.attention_backend == "flashinfer":
+            print(f"forward_absorb_core, forward_batch: {forward_batch}", q_nope_out.shape, k_nope.shape, k_pe.shape, q_pe.shape, flush=True)
             attn_output = self.attn_mqa(
                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
             )

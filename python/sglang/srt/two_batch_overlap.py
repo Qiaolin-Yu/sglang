@@ -1,10 +1,12 @@
 import dataclasses
 import logging
 from typing import Dict, List, Optional, Sequence
+from typing import Union
 
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSummableTensorPairFn,
@@ -31,7 +33,11 @@ def compute_split_seq_index(
     forward_mode: "ForwardMode",
     num_tokens: int,
     extend_lens: Optional[Sequence[int]],
+    draft_token_num_per_batch: Optional[int] = None,
 ) -> Optional[int]:
+    if forward_mode.is_target_verify():
+        assert draft_token_num_per_batch is not None
+        return (num_tokens // draft_token_num_per_batch) // 2
     if forward_mode.is_extend():
         assert extend_lens is not None
         return _split_array_by_half_sum(extend_lens)
@@ -67,7 +73,11 @@ def compute_split_token_index(
     split_seq_index: int,
     forward_mode: "ForwardMode",
     extend_seq_lens: Optional[Sequence[int]],
+    draft_token_num_per_batch: Optional[int] = None,
 ) -> int:
+    if forward_mode.is_target_verify():
+        assert draft_token_num_per_batch is not None
+        return split_seq_index * draft_token_num_per_batch
     if forward_mode.is_extend():
         assert extend_seq_lens is not None
         return sum(extend_seq_lens[:split_seq_index])
@@ -83,19 +93,26 @@ def compute_split_token_index(
 def compute_split_indices_for_cuda_graph_replay(
     forward_mode: ForwardMode,
     cuda_graph_num_tokens: int,
+    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
 ):
     forward_mode_for_tbo_split = (
         forward_mode if forward_mode != ForwardMode.IDLE else ForwardMode.DECODE
     )
+    if forward_mode.is_target_verify():
+        draft_token_num_per_batch = spec_info.draft_token_num
+    else:
+        draft_token_num_per_batch = None
     tbo_split_seq_index = compute_split_seq_index(
         forward_mode=forward_mode_for_tbo_split,
         num_tokens=cuda_graph_num_tokens,
         extend_lens=None,
+        draft_token_num_per_batch=draft_token_num_per_batch,
     )
     tbo_split_token_index = compute_split_token_index(
         split_seq_index=tbo_split_seq_index,
         forward_mode=forward_mode_for_tbo_split,
         extend_seq_lens=None,
+        draft_token_num_per_batch=draft_token_num_per_batch,
     )
     return tbo_split_seq_index, tbo_split_token_index
 
@@ -110,11 +127,16 @@ class TboCudaGraphRunnerPlugin:
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
         if not global_server_args_dict["enable_two_batch_overlap"]:
             return
+        if batch.forward_mode.is_target_verify():
+            draft_token_num_per_batch = batch.spec_info.draft_token_num
+        else:
+            draft_token_num_per_batch = None
 
         batch.tbo_split_seq_index = compute_split_seq_index(
             forward_mode=batch.forward_mode,
             num_tokens=num_tokens,
             extend_lens=None,
+            draft_token_num_per_batch=draft_token_num_per_batch,
         )
         # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
         assert batch.tbo_split_seq_index is not None, f"{num_tokens=}"
@@ -129,13 +151,17 @@ class TboCudaGraphRunnerPlugin:
         )
 
     def replay_prepare(
-        self, forward_mode: ForwardMode, bs: int, num_token_non_padded: int
+        self, forward_mode: ForwardMode, bs: int, num_token_non_padded: int, spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]]
     ):
+        if forward_mode.is_target_verify():
+            token_num_per_batch = spec_info.draft_token_num
+        else:
+            token_num_per_batch = 1
         tbo_split_seq_index, tbo_split_token_index = (
             compute_split_indices_for_cuda_graph_replay(
                 forward_mode=forward_mode,
-                # TODO support bs!=num_tokens
-                cuda_graph_num_tokens=bs,
+                cuda_graph_num_tokens=bs * token_num_per_batch,
+                spec_info=spec_info,
             )
         )
 
@@ -154,14 +180,19 @@ class TboDPAttentionPreparer:
         self.enable_two_batch_overlap = enable_two_batch_overlap
 
         if local_batch is not None:
+            if local_batch.forward_mode.is_target_verify():
+                draft_token_num_per_batch = local_batch.spec_info.draft_token_num
+            else:
+                draft_token_num_per_batch = None
             self.local_tbo_split_seq_index = compute_split_seq_index(
                 forward_mode=local_batch.forward_mode,
                 num_tokens=local_batch.input_ids.shape[0],
                 extend_lens=local_batch.extend_lens,
+                draft_token_num_per_batch=draft_token_num_per_batch,
             )
             resolved_deepep_mode = deepep_mode.resolve(local_batch.forward_mode)
             local_can_run_tbo = (self.local_tbo_split_seq_index is not None) and not (
-                local_batch.forward_mode.is_extend()
+                (local_batch.forward_mode.is_extend() and not local_batch.forward_mode.is_target_verify())
                 and enable_deepep_moe
                 and (resolved_deepep_mode == DeepEPMode.low_latency)
             )
@@ -236,7 +267,12 @@ class TboForwardBatchPreparer:
         from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 
         tbo_split_token_index = cls._compute_split_token_index(batch)
-
+        print(
+            f"TboForwardBatchPreparer.prepare "
+            f"tbo_split_seq_index={batch.tbo_split_seq_index} "
+            f"tbo_split_token_index={tbo_split_token_index} "
+            f"extend_seq_lens={batch.extend_seq_lens_cpu}"
+        )
         if _tbo_debug:
             logger.info(
                 f"TboForwardBatchPreparer.prepare "
@@ -273,6 +309,8 @@ class TboForwardBatchPreparer:
 
         assert batch.tbo_children is None
         batch.tbo_children = [child_a, child_b]
+        print(f"batch: {batch}")
+        print(f"batch.tbo_children: {batch.tbo_children}")
 
     @classmethod
     def filter_batch(
@@ -346,7 +384,7 @@ class TboForwardBatchPreparer:
         )
 
         # TODO improve, e.g. unify w/ `init_raw`
-        if global_server_args_dict["moe_dense_tp_size"] == 1:
+        if global_server_args_dict["moe_dense_tp_size"] == 1 or batch.forward_mode.is_target_verify():
             sum_len = end_token_index - start_token_index
             gathered_buffer = torch.zeros(
                 (sum_len, batch.gathered_buffer.shape[1]),
@@ -370,7 +408,7 @@ class TboForwardBatchPreparer:
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
-                global_num_tokens_gpu=None,
+                global_num_tokens_gpu=batch.global_num_tokens_gpu,
                 global_num_tokens_cpu=None,
                 gathered_buffer=gathered_buffer,
                 global_num_tokens_for_logprob_gpu=None,
@@ -416,18 +454,27 @@ class TboForwardBatchPreparer:
 
     @classmethod
     def _compute_split_token_index(cls, batch: ForwardBatch):
+        if batch.forward_mode.is_target_verify():
+            draft_token_num_per_batch = batch.spec_info.draft_token_num
+        else:
+            draft_token_num_per_batch = None
         return compute_split_token_index(
             split_seq_index=batch.tbo_split_seq_index,
             forward_mode=batch.forward_mode,
             extend_seq_lens=batch.extend_seq_lens_cpu,
+            draft_token_num_per_batch=draft_token_num_per_batch,
         )
 
 
 def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
-    if forward_mode.is_extend():
-        return input_ids.shape[0]
-    elif forward_mode.is_decode() or forward_mode.is_idle():
+    if (
+        forward_mode.is_decode()
+        or forward_mode.is_idle()
+        or forward_mode.is_target_verify()
+    ):
         return None
+    elif forward_mode.is_extend():
+        return input_ids.shape[0]
     raise NotImplementedError
 
 
@@ -551,6 +598,7 @@ def _model_forward_tbo_split_inputs_raw(
     forward_batch: ForwardBatch,
     zero_allocator: Optional[BumpAllocator],
 ) -> List[Dict]:
+    # print(f"forward_batch: {forward_batch}")
     return [
         dict(
             **_model_forward_filter_inputs(

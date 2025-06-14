@@ -436,6 +436,7 @@ class CudaGraphRunner:
             logger.info(log_message)
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
+        print(f"capture_one_batch_size, bs: {bs}", flush=True)
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
